@@ -1,0 +1,124 @@
+name: Publish verified PDF library
+on: workflow_dispatch
+permissions:
+  contents: write
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Verify every PDF and publish category archives
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: python
+        run: |
+          import base64
+          import csv
+          import hashlib
+          import io
+          import json
+          import os
+          from concurrent.futures import ThreadPoolExecutor
+          from pathlib import Path
+          import re
+          import tempfile
+          import time
+          import urllib.parse
+          import urllib.request
+          import zipfile
+          
+          repo = os.environ['GITHUB_REPOSITORY']
+          commit = os.environ['GITHUB_SHA']
+          release_id = 445199088
+          tag = 'pdf-library-2026-11-14'
+          headers = {'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                     'Accept': 'application/vnd.github+json',
+                     'Content-Type': 'application/json',
+                     'X-GitHub-Api-Version': '2022-11-28', 'User-Agent': 'Sudoku-PDF-Publisher'}
+          
+          def api(path, data=None, method=None):
+              request = urllib.request.Request('https://api.github.com/repos/' + repo + path,
+                  headers=headers, data=json.dumps(data).encode() if data is not None else None, method=method)
+              with urllib.request.urlopen(request, timeout=120) as response:
+                  body = response.read()
+              return json.loads(body) if body else None
+          
+          def source_file(name):
+              with urllib.request.urlopen(f'https://raw.githubusercontent.com/{repo}/{commit}/{name}', timeout=60) as response:
+                  return response.read().decode('utf-8-sig')
+          
+          rows = list(csv.DictReader(io.StringIO(source_file('pdf-manifest.csv'))))
+          assert len(rows) == 4258
+          groups = {}
+          for row in rows:
+              assert '..' not in Path(row['pdf_path_in_archive']).parts
+              groups.setdefault(row['download_archive'], []).append(row)
+          assert len(groups) == 45
+          checksums = dict((name, digest) for digest, name in
+              (line.split() for line in source_file('SHA256SUMS.txt').splitlines() if line.strip()))
+          assets = api(f'/releases/{release_id}/assets?per_page=100')
+          assert all(a['name'] in groups for a in assets)
+          complete = {a['name']: a for a in assets if a['state'] == 'uploaded'}
+          for asset in assets:
+              if asset['state'] != 'uploaded':
+                  api('/releases/assets/' + str(asset['id']), method='DELETE')
+          
+          def publish_category(item):
+              name, members = item
+              if name in complete:
+                  assert complete[name]['digest'] == 'sha256:' + checksums[name], name
+                  print(f'Already uploaded and verified: {name}', flush=True)
+                  return name, checksums[name]
+              with tempfile.TemporaryDirectory() as work:
+                  archive = Path(work) / name
+                  with zipfile.ZipFile(archive, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as bundle:
+                      for row in members:
+                          url = 'https://sudokuprintout.com/pdf/' + urllib.parse.quote(row['pdf_path_in_archive'], safe='/')
+                          for attempt in range(3):
+                              try:
+                                  with urllib.request.urlopen(url, timeout=90) as response:
+                                      content = response.read()
+                                  break
+                              except Exception:
+                                  if attempt == 2:
+                                      raise
+                                  time.sleep(3)
+                          assert len(content) == int(row['pdf_bytes']), row['pdf_path_in_archive']
+                          assert hashlib.sha256(content).hexdigest() == row['sha256'], row['pdf_path_in_archive']
+                          bundle.writestr(row['pdf_path_in_archive'], content)
+                  content = archive.read_bytes()
+                  digest = hashlib.sha256(content).hexdigest()
+                  request = urllib.request.Request(
+                      f'https://uploads.github.com/repos/{repo}/releases/{release_id}/assets?name={urllib.parse.quote(name)}',
+                      data=content, headers={**headers, 'Content-Type': 'application/zip'}, method='POST')
+                  with urllib.request.urlopen(request, timeout=300) as response:
+                      result = json.load(response)
+                  assert result['state'] == 'uploaded' and result['size'] == len(content)
+                  assert result['digest'] == 'sha256:' + digest
+                  print(f'Uploaded {name}: {len(members)} exact-source PDFs; sha256={digest}', flush=True)
+                  return name, digest
+          
+          with ThreadPoolExecutor(max_workers=6) as workers:
+              checksums.update(dict(workers.map(publish_category, sorted(groups.items()))))
+          assets = api(f'/releases/{release_id}/assets?per_page=100')
+          assert len(assets) == 45 and {a['name'] for a in assets} == set(groups)
+          assert all(a['state'] == 'uploaded' and a['digest'] == 'sha256:' + checksums[a['name']] for a in assets)
+          
+          def update_file(path, content):
+              old = api('/contents/' + path)
+              api('/contents/' + path, {'message': 'Record verified PDF release checksums and sizes',
+                  'sha': old['sha'], 'content': base64.b64encode(content.encode()).decode()}, method='PUT')
+          
+          update_file('SHA256SUMS.txt', ''.join(f'{checksums[name]}  {name}\n' for name in sorted(groups)))
+          readme = source_file('README.md')
+          for asset in assets:
+              name = re.escape(asset['name'])
+              readme = re.sub(r'(\| \d+ \| )[\d.]+ MiB( \| \[Download ZIP\]\([^\n]*/' + name + r'\))',
+                  lambda match: match[1] + f'{asset["size"]/1048576:.1f} MiB' + match[2], readme)
+          update_file('README.md', readme)
+          published = api(f'/releases/{release_id}', {'tag_name': tag, 'target_commitish': 'main',
+              'draft': False, 'prerelease': False, 'make_latest': 'true'}, method='PATCH')
+          assert published['tag_name'] == tag and not published['draft']
+          summary = f'Published 4,258 exact-source PDFs in 45 category ZIPs.\n\n{published["html_url"]}\n'
+          Path(os.environ['GITHUB_STEP_SUMMARY']).write_text(summary, encoding='utf-8')
+          print(summary, flush=True)
